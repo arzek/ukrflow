@@ -1,0 +1,7 @@
+mlx-whisper
+mlx-lm
+sounddevice
+pynput
+numpy
+anthropic
+rumps
