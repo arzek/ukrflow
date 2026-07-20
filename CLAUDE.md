@@ -14,7 +14,11 @@ UkrFlow — голосовий диктант українською для macO
 ./run.sh --set-hotkey clean   # окрема клавіша разового диктування в режимі
 ./run.sh --retry [--mode X]   # переобробити останній запис із recordings/
 ./install.sh                  # встановлення на новому Mac (venv + залежності)
+./install-autostart.sh        # автозапуск при вході в систему (LaunchAgent)
+./uninstall-autostart.sh      # вимкнути автозапуск і зупинити процес
 ```
+
+Автозапуск: LaunchAgent `com.ukrflow.app` викликає `.venv/bin/python ukrflow.py` **напряму** (не через `run.sh`) з `WorkingDirectory`. Проєкт **мусить лежати поза теками, захищеними TCC** (Desktop/Documents/Downloads): при вході в систему launchd/xpcproxy не може читати їх вміст — `posix_spawn` падає з «Operation not permitted» ще до старту Python, і жодні дозволи Python це не обходять (з термінала при цьому все працює — саме тому збій видно лише після перезавантаження). Тому проєкт фізично живе в `~/ukrflow`, а `~/Desktop/ukrflow` — симлінк для зручності; `install-autostart.sh` пише в plist фізичні шляхи (`pwd -P`) і відмовляється встановлюватись із захищеної теки. `KeepAlive.SuccessfulExit=false` — перезапуск після збою, але не після ручного Quit. Перед ручним `./run.sh` агент зупиняти (`./uninstall-autostart.sh` або `launchctl bootout`), інакше два екземпляри б'ються за клавіші й мікрофон; перезапуск після зміни коду: `launchctl kickstart -k gui/$(id -u)/com.ukrflow.app`.
 
 Тестового фреймворку немає — перевірки виконуються ad-hoc скриптами через `.venv/bin/python` (див. «Конвенції тестування» нижче). Синтаксис: `.venv/bin/python -c "import ast; ast.parse(open('ukrflow.py').read())"`.
 
