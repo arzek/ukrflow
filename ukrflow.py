@@ -89,10 +89,14 @@ DEFAULT_CONFIG = {
         "clean": {
             "label": "Clean — шліфування без переробки",
             "prompt_file": "prompts/clean.md",
+            "polish_codex_model": "gpt-5.6-terra",
+            "polish_codex_effort": "low",
         },
         "prompt": {
             "label": "Prompt — шліфування + prompt engineering",
             "prompt_file": "prompts/prompt.md",
+            "polish_codex_model": "gpt-5.6-sol",
+            "polish_codex_effort": "high",
         },
     },
     # Додаткові спроби при збоях розпізнавання/шліфування
