@@ -6,7 +6,10 @@ cd "$(dirname "$0")"
 
 [ "$(uname -m)" = "arm64" ] || { echo "❌ Потрібен Apple Silicon (M1+): MLX не працює на Intel"; exit 1; }
 command -v python3 >/dev/null || { echo "❌ Потрібен Python 3: xcode-select --install"; exit 1; }
-command -v claude >/dev/null || echo "⚠️  Claude Code CLI не знайдено — шліфування через підписку не працюватиме (npm install -g @anthropic-ai/claude-code)"
+if ! command -v codex >/dev/null && ! command -v claude >/dev/null; then
+  echo "⚠️  Не знайдено ні Codex, ні Claude Code CLI — хмарне шліфування не працюватиме"
+  echo "   Встановіть і залогіньте хоча б один із них, потім оберіть його в меню «Бекенд»."
+fi
 
 python3 -m venv .venv
 .venv/bin/pip install --quiet --upgrade pip

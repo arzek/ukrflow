@@ -51,11 +51,15 @@ DEFAULT_CONFIG = {
     # одразу писатиме їх латиницею (це словниковий байас, а не інструкція).
     "initial_prompt": "Диктування українською мовою, з розділовими знаками.",
     # Шліфування тексту:
-    #   "claude-code" — через Claude Code CLI і вашу підписку (за замовч.)
+    #   "codex"       — через Codex CLI і вашу підписку ChatGPT (за замовч.)
+    #   "claude-code" — через Claude Code CLI і вашу підписку
     #   "local"       — Qwen3 через MLX, повністю офлайн
     #   "api"         — Claude API, потрібен ANTHROPIC_API_KEY
     #   "off"         — без шліфування
-    "polish": "claude-code",
+    "polish": "codex",
+    # Модель та глибина мислення для Codex (доступність залежить від акаунта)
+    "polish_codex_model": "gpt-5.6-terra",
+    "polish_codex_effort": "low",
     # Модель та глибина мислення для claude-code (opus + low ≈ 5–10 с)
     "polish_claude_code_model": "opus",
     "polish_claude_code_effort": "low",
@@ -390,6 +394,44 @@ def _polish_claude_code(text: str, config: dict) -> str:
     return _validate_polish(text, result.stdout.decode())
 
 
+def _polish_codex(text: str, config: dict) -> str:
+    """Шліфування через Codex CLI — використовує підписку ChatGPT, без API-ключів.
+    Codex не має окремого системного промпту: інструкцію передаємо позиційним
+    промптом, а розшифровку — через stdin (codex додає її як <stdin>-блок), щоб
+    модель не сплутала імперативне диктування зі зверненням до себе.
+    Кожен виклик герметичний: --ephemeral (сесія не пишеться на диск),
+    --ignore-user-config (не вантажаться MCP-сервери й модель із ~/.codex),
+    --ignore-rules, --sandbox read-only і порожня тимчасова робоча тека — тож
+    codex не бачить проєкту й не запускає інструментів. Модель і глибину мислення
+    задаємо явно (бо ігноруємо config.toml); авторизація читається з CODEX_HOME.
+    Фінальну відповідь беремо з файлу --output-last-message, а не з галасливого
+    потоку подій stdout."""
+    with tempfile.TemporaryDirectory(prefix="ukrflow-codex-polish-") as dirname:
+        workdir = Path(dirname)
+        out_file = workdir / "last_message.txt"
+        command = [
+            "codex", "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
+            "--sandbox", "read-only",
+            "--color", "never",
+            "--cd", str(workdir),
+            "--model", config["polish_codex_model"],
+            "-c", f'model_reasoning_effort="{config["polish_codex_effort"]}"',
+            "--output-last-message", str(out_file),
+            load_polish_prompt(config),
+        ]
+        result = subprocess.run(
+            command, input=wrap_transcript(text).encode("utf-8"),
+            capture_output=True, timeout=600, cwd=workdir,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.decode().strip() or "codex CLI error")
+        return _validate_polish(text, out_file.read_text())
+
+
 def _polish_api(text: str, config: dict) -> str:
     import anthropic
     response = anthropic.Anthropic().messages.create(
@@ -406,9 +448,20 @@ def _polish_api(text: str, config: dict) -> str:
 
 
 POLISH_BACKENDS = {
+    "codex": _polish_codex,
     "claude-code": _polish_claude_code,
     "local": _polish_local,
     "api": _polish_api,
+}
+
+# Людські назви бекендів для меню/логів. Порядок = порядок у підменю «Бекенд».
+# "off" тут немає бекенд-функції — це вимкнене шліфування (обробляється окремо).
+BACKEND_LABELS = {
+    "codex": "Codex (ChatGPT)",
+    "claude-code": "Claude Code",
+    "local": "Локальна (Qwen3, офлайн)",
+    "api": "Claude API",
+    "off": "Без шліфування",
 }
 
 
@@ -570,6 +623,7 @@ class UkrFlow:
         }
         self.status = StatusIndicator()
         self.mode_menu_items: dict = {}
+        self.backend_menu_items: dict = {}
         self.active_mode: str | None = None
         self.recording = False
         # Стан детектора подвійного тапу основної клавіші
@@ -838,6 +892,27 @@ class UkrFlow:
         print(f"🔀 Режим: {label}")
         notify(f"Режим: {label}")
 
+    def set_backend(self, name: str) -> None:
+        """Липке перемикання LLM-бекенда: діє з наступного диктування,
+        зберігається в конфіг і не потребує перезапуску застосунку."""
+        if name not in BACKEND_LABELS:
+            raise ValueError(f"Невідомий бекенд шліфування: {name!r}")
+        self.config["polish"] = name
+        save_config(self.config)
+        if self.backend_menu_items:
+            # Callback rumps уже працює в головному потоці, але цей метод також
+            # можна викликати з інших потоків/майбутніх гарячих клавіш.
+            from Foundation import NSOperationQueue
+
+            def update_checkmarks():
+                for backend_name, item in self.backend_menu_items.items():
+                    item.state = 1 if backend_name == name else 0
+
+            NSOperationQueue.mainQueue().addOperationWithBlock_(update_checkmarks)
+        label = BACKEND_LABELS[name]
+        print(f"🧠 Бекенд: {label}")
+        notify(f"Бекенд шліфування: {label}")
+
     def warmup(self) -> None:
         """Завантажує модель одразу при старті, щоб перший диктант не гальмував."""
         print("Завантажую модель (перший запуск може тривати кілька хвилин)…")
@@ -862,6 +937,7 @@ class UkrFlow:
         print(
             f"\n🇺🇦 UkrFlow запущено. Утримуйте [{self.config['hotkey']}] і говоріть.\n"
             f"   Режим: {mode} (перемикання — в іконці menu bar).\n"
+            f"   Бекенд: {BACKEND_LABELS.get(self.config.get('polish'), self.config.get('polish'))}.\n"
             f"   Лог пайплайна: {LOG_PATH.name}. Зупинити: Ctrl+C у цьому вікні.\n"
         )
         self.status.idle_title = "🎙" + mode_suffix(mode)
@@ -908,8 +984,18 @@ class UkrFlow:
             item.state = 1 if name == self.config.get("mode") else 0
             mode_menu.add(item)
             self.mode_menu_items[name] = item
+        backend_menu = rumps.MenuItem("Бекенд")
+        for name, label in BACKEND_LABELS.items():
+            item = rumps.MenuItem(
+                label,
+                callback=(lambda n: lambda _: self.set_backend(n))(name),
+            )
+            item.state = 1 if name == self.config.get("polish") else 0
+            backend_menu.add(item)
+            self.backend_menu_items[name] = item
         app.menu = [
             mode_menu,
+            backend_menu,
             rumps.MenuItem(
                 "Відкрити лог",
                 callback=lambda _: subprocess.Popen(["open", str(LOG_PATH)]),
