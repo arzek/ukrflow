@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -360,7 +361,12 @@ def _polish_claude_code(text: str, config: dict) -> str:
     """Шліфування через Claude Code CLI — використовує підписку користувача,
     без API-ключів. Сесії не зберігаються (--no-session-persistence).
     Інструкція — системним промптом, розшифровка — через stdin: в одному
-    user-ході модель плутає імперативне диктування зі зверненням до себе."""
+    user-ході модель плутає імперативне диктування зі зверненням до себе.
+    Кожен виклик герметичний: без інструментів (--disallowed-tools "*") і з
+    порожньою робочою текою — з cwd проєкту claude бачить його CLAUDE.md
+    і може прочитати ukrflow.log з усіма попередніми диктуваннями."""
+    workdir = Path(tempfile.gettempdir()) / "ukrflow-polish"
+    workdir.mkdir(exist_ok=True)
     command = [
         "claude", "-p",
         "--system-prompt", load_polish_prompt(config),
@@ -369,6 +375,7 @@ def _polish_claude_code(text: str, config: dict) -> str:
         "--no-session-persistence",
         "--output-format", "text",
         "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--disallowed-tools", "*",
     ]
     env = os.environ | {
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
@@ -376,7 +383,7 @@ def _polish_claude_code(text: str, config: dict) -> str:
     }
     result = subprocess.run(
         command, input=wrap_transcript(text).encode("utf-8"),
-        capture_output=True, timeout=600, env=env,
+        capture_output=True, timeout=600, env=env, cwd=workdir,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode().strip() or "claude CLI error")
