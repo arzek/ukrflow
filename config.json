@@ -11,7 +11,7 @@
   "polish_local_model": "mlx-community/Qwen3-8B-4bit",
   "polish_api_model": "claude-opus-4-8",
   "polish_min_chars": 25,
-  "mode": "prompt",
+  "mode": "raw",
   "mode_cycle_double_tap": true,
   "tap_max_sec": 0.35,
   "double_tap_gap_sec": 0.5,
@@ -38,6 +38,7 @@
   "min_duration_sec": 0.4,
   "silence_rms_threshold": 0.004,
   "restore_clipboard": true,
+  "paste_requires_focus": true,
   "append_space": true,
   "sounds": true,
   "input_device": null

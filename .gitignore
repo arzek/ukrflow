@@ -3,3 +3,5 @@ __pycache__/
 recordings/
 ukrflow.log
 launchd.log
+dist/
+build/
