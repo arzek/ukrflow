@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import queue
 import threading
 import time
 from pathlib import Path
@@ -633,6 +634,30 @@ def resolve_hotkey(name: str):
         raise SystemExit(f"Невідома клавіша в конфігу: {name!r}")
 
 
+def _key_vk(key) -> "int | None":
+    """Віртуальний код клавіші для опитування її фізичного стану через Quartz.
+    Працює і для модифікаторів (Key.cmd_r → 54), і для звичайних / vk:NN клавіш."""
+    vk = getattr(key, "vk", None)
+    if vk is None:
+        vk = getattr(getattr(key, "value", None), "vk", None)
+    return vk
+
+
+def _session_on_console() -> bool:
+    """Чи ця GUI-сесія зараз активна (на екрані). За Fast User Switching лише
+    активна сесія володіє мікрофоном і отримує події клавіатури; фонова копія
+    UkrFlow має «спати», щоб не тримати мікрофон і не плутати запис. Якщо
+    визначити не вдалося — вважаємо активною (не блокуємо роботу)."""
+    try:
+        d = Quartz.CGSessionCopyCurrentDictionary()
+    except Exception:
+        return True
+    if not d:
+        return True
+    val = d.get("kCGSSessionOnConsoleKey")
+    return True if val is None else bool(val)
+
+
 # Клавіші-модифікатори: безпечні для утримання (самі по собі нічого не друкують)
 MODIFIER_NAMES = {
     "alt", "alt_l", "alt_r", "cmd", "cmd_l", "cmd_r",
@@ -713,6 +738,14 @@ class UkrFlow:
         self.backend_menu_items: dict = {}
         self.active_mode: str | None = None
         self.recording = False
+        # Чи активна (на екрані) наша GUI-сесія. За Fast User Switching фонова
+        # копія має «спати»: не тримати мікрофон і не стартувати запис.
+        self._session_active = True
+        # Старт/стоп запису серіалізуються через цю чергу й окремий воркер —
+        # щоб callback слухача клавіш був миттєвий і не вимикав event-tap.
+        self._cmd_queue: "queue.Queue" = queue.Queue()
+        # Покоління запису — щоб вотчдог не зачепив уже наступне диктування
+        self._rec_gen = 0
         # Стан детектора подвійного тапу основної клавіші
         self._press_time = 0.0
         self._last_tap_release = 0.0
@@ -723,18 +756,22 @@ class UkrFlow:
 
     # ── Запис ──────────────────────────────────────────────────────────────
 
-    def start_recording(self, mode_name: str | None = None) -> None:
+    def start_recording(self, mode_name: str | None = None, key=None) -> None:
         if self.recording:
+            return
+        if not self._session_active:
+            # Профіль у фоні (Fast User Switching) — мікрофон належить активній
+            # сесії; не намагаємось записувати, щоб не конфліктувати з UkrFlow там.
             return
         # Режим фіксується в момент натискання: клавіша режиму → разовий
         # режим, основна клавіша → поточний «липкий» з конфігу
         self.active_mode = mode_name or self.config.get("mode")
         self.chunks = []
-        # Мікрофон відкриваємо ДО виставлення recording=True. Якщо він зайнятий
-        # (напр. паралельно працює другий екземпляр UkrFlow) або CoreAudio дав
-        # збій — не лишаємо застосунок у стані «нібито пише» і, головне, не даємо
-        # винятку піднятися в callback слухача pynput: там будь-який виняток
-        # фатальний — слухач зупиняється назавжди й потрібен перезапуск процесу.
+        # Мікрофон відкриваємо тут — у воркері запису, а НЕ в callback слухача
+        # клавіш: відкриття CoreAudio-потоку інколи триває понад секунду, а якщо
+        # блокувати ним callback event-tap, macOS вимикає tap за таймаутом — і
+        # подія release уже не доходить (pynput її не відновлює), запис «зависає».
+        # Виняток теж не пускаємо далі (зайнятий мікрофон тощо).
         try:
             stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
@@ -750,7 +787,17 @@ class UkrFlow:
             notify(f"Мікрофон недоступний: {exc}")
             return
         self.stream = stream
+        self._rec_gen += 1
+        gen = self._rec_gen
         self.recording = True
+        # Вотчдог: якщо подія release клавіші загубиться (event-tap міг вимкнутись),
+        # він за фізичним станом клавіші помітить відпускання й зупинить запис —
+        # так довге диктування не втрачається. HID-стан читається незалежно від tap.
+        vk = _key_vk(key) if key is not None else None
+        if vk is not None:
+            threading.Thread(
+                target=self._watch_release, args=(vk, gen), daemon=True
+            ).start()
         # Аудіо пишеться з першої мілісекунди, але фідбек (звук + 🔴)
         # відкладаємо до порогу тапу — щоб подвійний тап перемикання режиму
         # не виглядав і не звучав як запис
@@ -780,8 +827,9 @@ class UkrFlow:
         if self._confirm_timer is not None:
             self._confirm_timer.cancel()
             self._confirm_timer = None
-        # Гарантовано закриваємо мікрофон, навіть якщо тут щось піде не так —
-        # інакше потік лишиться відкритим і застосунок «слухатиме» далі.
+        # Закриваємо мікрофон і забираємо аудіо — швидко. Уся важка робота
+        # (склейка масиву, запис WAV, розпізнавання) — окремим потоком, щоб не
+        # блокувати ні воркер запису, ні (через нього) потік слухача клавіш.
         stream, self.stream = self.stream, None
         if stream is not None:
             try:
@@ -789,10 +837,19 @@ class UkrFlow:
                 stream.close()
             except Exception as exc:
                 print(f"⚠️  Помилка закриття мікрофона: {exc}")
+        chunks, self.chunks = self.chunks, []
+        threading.Thread(
+            target=self._finalize_recording,
+            args=(chunks, self.active_mode),
+            daemon=True,
+        ).start()
 
+    def _finalize_recording(self, chunks, mode_name) -> None:
+        """Склейка аудіо, збереження на диск і запуск обробки — у власному
+        потоці (важке, тому поза потоком запису й слухача клавіш)."""
         audio = (
-            np.concatenate(self.chunks)[:, 0]
-            if self.chunks
+            np.concatenate(chunks)[:, 0]
+            if chunks
             else np.zeros(0, dtype=np.float32)
         )
         duration = len(audio) / SAMPLE_RATE
@@ -814,12 +871,32 @@ class UkrFlow:
 
         # Аудіо на диск ще ДО обробки: за будь-якого збою далі голос збережено
         wav_path = save_recording(audio, self.config["keep_recordings"])
+        self._process_safely(audio, duration, wav_path, mode_name)
 
-        threading.Thread(
-            target=self._process_safely,
-            args=(audio, duration, wav_path, self.active_mode),
-            daemon=True,
-        ).start()
+    def _watch_release(self, vk: int, gen: int) -> None:
+        """Стежить за фізичним станом гарячої клавіші під час запису. Якщо бачив
+        її натиснутою, а потім відпущеною, поки запис ще триває, — подія release
+        загубилась (event-tap міг вимкнутись за таймаутом); зупиняємо запис самі,
+        диктування не гине. Зупиняє ЛИШЕ після того, як реально побачив клавішу
+        натиснутою, — тож якщо опитування стану для цієї клавіші не працює, запис
+        не обрізається (безпечний фолбек на звичайний release)."""
+        seen_down = False
+        state = Quartz.kCGEventSourceStateCombinedSessionState
+        while self.recording and self._rec_gen == gen:
+            time.sleep(0.12)
+            if not (self.recording and self._rec_gen == gen):
+                return
+            try:
+                down = bool(Quartz.CGEventSourceKeyState(state, vk))
+            except Exception:
+                return
+            if down:
+                seen_down = True
+            elif seen_down:
+                print("⚠️  Клавішу відпущено, але подія release не дійшла — "
+                      "зупиняю запис (вотчдог). Диктування збережено.")
+                self._cmd_queue.put(("stop", None, None))
+                return
 
     # ── Розпізнавання і вставлення ─────────────────────────────────────────
 
@@ -952,27 +1029,63 @@ class UkrFlow:
     # ── Гаряча клавіша ─────────────────────────────────────────────────────
 
     def on_press(self, key) -> None:
-        # pynput трактує будь-який виняток у callback як фатальний і зупиняє
-        # слухач назавжди (тоді єдиний вихід — перезапуск). Тому ловимо все тут
-        # і лишаємо слухач живим — навіть якщо конкретне натискання не вдалося.
+        # Callback слухача мусить повертатися миттєво: важку роботу (відкриття
+        # мікрофона, склейку, збереження) виконує окремий воркер запису. Інакше
+        # повільний callback → macOS вимикає event-tap → губляться наступні події,
+        # у т.ч. release («відпустив клавішу, а воно все ще слухає»). Виняток тут
+        # pynput трактує як фатальний — тому теж ловимо все й лишаємо слухач живим.
         try:
             if key == self.hotkey:
                 self._press_time = time.time()
-                self.start_recording()
+                self._cmd_queue.put(("start", None, key))
             elif key in self.mode_hotkeys:
-                self.start_recording(mode_name=self.mode_hotkeys[key])
+                self._cmd_queue.put(("start", self.mode_hotkeys[key], key))
         except Exception as exc:
             print(f"⚠️  Помилка обробки натискання клавіші: {exc}")
 
     def on_release(self, key) -> None:
         try:
             if key == self.hotkey:
-                self.stop_recording()
+                self._cmd_queue.put(("stop", None, None))
                 self._handle_tap()
             elif key in self.mode_hotkeys:
-                self.stop_recording()
+                self._cmd_queue.put(("stop", None, None))
         except Exception as exc:
             print(f"⚠️  Помилка обробки відпускання клавіші: {exc}")
+
+    def _recorder_worker(self) -> None:
+        """Серіалізує старт/стоп запису поза потоком слухача клавіш. Команди
+        виконуються по черзі, тож старт завжди передує відповідному стопу
+        (без гонок «стоп раніше за старт»)."""
+        while True:
+            cmd, mode_name, key = self._cmd_queue.get()
+            try:
+                if cmd == "start":
+                    self.start_recording(mode_name, key)
+                elif cmd == "stop":
+                    self.stop_recording()
+            except Exception as exc:
+                print(f"⚠️  Помилка воркера запису: {exc}")
+
+    def _watch_session(self) -> None:
+        """Стежить, чи активна (на екрані) наша сесія. Коли профіль перемикають
+        у фон — зупиняє поточний запис і звільняє мікрофон, щоб ним міг
+        користуватися UkrFlow в активному профілі; коли профіль повертається на
+        екран — знову дозволяє диктувати. Так обидва профілі можуть автостартувати
+        UkrFlow без конфлікту за мікрофон і клавіші."""
+        while True:
+            time.sleep(1.0)
+            active = _session_on_console()
+            if active == self._session_active:
+                continue
+            self._session_active = active
+            if not active:
+                print("⏸  Профіль неактивний — звільняю мікрофон, чекаю.")
+                if self.recording:
+                    # Зберегти й обробити те, що вже наговорено, і віддати мікрофон
+                    self._cmd_queue.put(("stop", None, None))
+            else:
+                print("▶️  Профіль знову активний — UkrFlow готовий до диктування.")
 
     def _handle_tap(self) -> None:
         """Детектор подвійного тапу основної клавіші → циклічне перемикання
@@ -1074,6 +1187,11 @@ class UkrFlow:
         )
         self.status.idle_title = "🎙" + mode_suffix(mode)
         self.status.set(self.status.idle_title)
+        # Воркер запису — обробляє старт/стоп поза потоком слухача клавіш
+        threading.Thread(target=self._recorder_worker, daemon=True).start()
+        # Слідкування за активністю сесії (Fast User Switching)
+        self._session_active = _session_on_console()
+        threading.Thread(target=self._watch_session, daemon=True).start()
         listener = keyboard.Listener(
             on_press=self.on_press, on_release=self.on_release
         )
