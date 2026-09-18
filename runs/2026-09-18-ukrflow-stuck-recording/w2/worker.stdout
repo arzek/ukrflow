@@ -1,0 +1,13 @@
+{
+  "tool": "cursor",
+  "model": "auto",
+  "status": "QUOTA",
+  "seconds": 0,
+  "words": 0,
+  "exit_code": 1,
+  "error_hint": "breaker open for cursor until 2026-09-30T15:59:59Z: місячний кап Free-плану Cursor — до 1-го числа наступного місяця 00:00 локально (дата скидання UNVERIFIED) — quota/rate-limit: ActionRequiredError: You've hit your usage limit Get Cursor Pro for more  (resets in 290h03m) — not launched",
+  "breaker": {
+    "key": "cursor",
+    "until": "2026-09-30T15:59:59Z"
+  }
+}

@@ -1,0 +1,3 @@
+Офіційна документація: developer.apple.com (CGEventTap, CGEventType), docs.python.org (sys.stdout, -u, PYTHONUNBUFFERED), man launchd.plist / man launchctl, python-sounddevice.readthedocs.io.
+Репозиторії та issue-трекери: github.com/moses-palmer/pynput (код _util/darwin.py, keyboard/_darwin.py, issues про listener stops на macOS), github.com/PortAudio/portaudio та github.com/spatialaudio/python-sounddevice (issues про зависання stop/close і оновлення списку пристроїв).
+Заперечення: шукай джерела, які СПРОСТОВУЮТЬ твердження (напр. pynput уже обробляє kCGEventTapDisabledByTimeout у новіших версіях; Pa_StopStream не зависає; stdout у файл не блочно буферизується в Python 3.14).

@@ -1,0 +1,12 @@
+{
+  "tool": "copilot",
+  "model": "auto",
+  "seconds": 48,
+  "exit_code": 0,
+  "status": "OK",
+  "error_hint": "",
+  "tokens": 142186,
+  "words": 202,
+  "links": 6,
+  "model_resolved": "gpt-5.6-luna"
+}

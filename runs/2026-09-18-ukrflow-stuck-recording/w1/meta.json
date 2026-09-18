@@ -1,0 +1,11 @@
+{
+  "tool": "opencode",
+  "model": "muse-spark-1.3-contributor-free",
+  "seconds": 3,
+  "exit_code": 1,
+  "status": "ERROR",
+  "error_hint": "{\"name\": \"APIError\", \"data\": {\"message\": \"Error from provider (Console): OpenCode's free tier can only be used from within OpenCode\", \"statusCode\": 403, \"isRetryable\": false, \"responseHeaders\": {\"cf-placement\": \"remote-ORD\", \"cf-ray\": \"a3d0da2b4a13ff17-PDX\", \"connection\": \"keep-alive\", \"content-encoding\": \"br\", \"content-type\": \"application/json\", \"date\": \"Fri, 18 Sep 2026 13:56:07 GMT\", \"server\": ",
+  "tokens": null,
+  "words": 0,
+  "links": 0
+}

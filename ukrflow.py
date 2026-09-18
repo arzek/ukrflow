@@ -20,6 +20,7 @@ import tempfile
 import queue
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -127,6 +128,25 @@ DEFAULT_CONFIG = {
 
 SAMPLE_RATE = 16000
 
+# Мітка LaunchAgent — має збігатися з install-autostart.sh
+LAUNCHD_LABEL = "com.ukrflow.app"
+
+# Крок потоку здоров'я (перевірка event-tap, «глухого» tap-а, воркера)
+HEALTH_POLL_SEC = 0.5
+# Скільки клавіша має бути фізично натиснутою без жодної події від слухача,
+# щоб вважати event-tap глухим і перезапустити слухач
+DEAF_TAP_HOLD_SEC = 2.0
+# Скільки воркер запису може виконувати одну команду, перш ніж вважати його
+# заклиненим (зазвичай це зависле закриття CoreAudio-потоку)
+WORKER_STUCK_SEC = 15
+# Скільки чекати на закриття потоку мікрофона, перш ніж рухатись далі без нього
+STREAM_CLOSE_TIMEOUT_SEC = 3.0
+# Крок скидання аварійного журналу запису на диск
+JOURNAL_FLUSH_SEC = 1.0
+# Журнал живого (за pid) екземпляра, який стільки не змінювався, вважаємо
+# сиротою: pid у системі перевикористовується, а активний журнал росте щосекунди
+JOURNAL_STALE_SEC = 60
+
 # Типові галюцинації Whisper на тиші/шумі — такі результати відкидаємо
 HALLUCINATION_RE = re.compile(
     r"^(дякую( за (перегляд|увагу))?|субтитри.*|продовження (буде|в наступній частині)"
@@ -138,6 +158,14 @@ SOUND_START = "/System/Library/Sounds/Tink.aiff"
 SOUND_STOP = "/System/Library/Sounds/Pop.aiff"
 SOUND_DONE = "/System/Library/Sounds/Glass.aiff"
 SOUND_ERROR = "/System/Library/Sounds/Basso.aiff"
+
+
+def diag(message: str) -> None:
+    """Подія життєвого циклу з міткою часу. Під launchd це єдиний слід
+    інциденту (зависання, вимкнений event-tap, перезапуск) — звичайні
+    користувацькі print-и про хід диктування лишаються без мітки."""
+    stamp = datetime.datetime.now().strftime("%m-%d %H:%M:%S")
+    print(f"[{stamp}] {message}", flush=True)
 
 
 def notify(message: str) -> None:
@@ -575,31 +603,142 @@ def log_block(header: str, body: str = "") -> None:
             f.write(body + "\n")
 
 
-def save_last_result(text: str, mode_name: str | None) -> None:
+def save_last_result(text: str, mode_name: str | None, note: str = "") -> None:
     """Перезаписує last.md фінальним текстом останнього диктування — миттєвий
     доступ через пункт меню «Останній результат», без скролу лога донизу.
     Лише текст (+ короткий заголовок): Cmd+A / Cmd+C дає чисту копію."""
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    LAST_PATH.write_text(f"<!-- {stamp} · режим: {mode_name} -->\n\n{text}\n")
+    header = f"<!-- {stamp} · режим: {mode_name}{' · ' + note if note else ''} -->"
+    LAST_PATH.write_text(f"{header}\n\n{text}\n")
 
 
-def save_recording(audio: np.ndarray, keep: int) -> Path:
+def save_recording(audio: np.ndarray, keep: int, stamp: str | None = None) -> Path:
     """Зберігає запис у recordings/*.wav одразу після відпускання клавіші —
-    голос не втрачається за жодного збою далі. Старі записи чистяться."""
+    голос не втрачається за жодного збою далі. Старі записи чистяться.
+    Ім'я можна задати явно (відновлення з аварійного журналу зберігає час
+    початку диктування, а не час відновлення)."""
     import wave
 
     RECORDINGS_DIR.mkdir(exist_ok=True)
-    path = RECORDINGS_DIR / (
-        datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".wav"
-    )
+    stamp = stamp or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = RECORDINGS_DIR / f"{stamp}.wav"
     with wave.open(str(path), "wb") as f:
         f.setnchannels(1)
         f.setsampwidth(2)
         f.setframerate(SAMPLE_RATE)
         f.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
     for old in sorted(RECORDINGS_DIR.glob("*.wav"))[:-keep]:
-        old.unlink()
+        # Щойно записаний файл не чіпаємо: у відновленого з журналу stamp старий,
+        # і чистка за іменем видалила б саме його
+        if old != path:
+            old.unlink(missing_ok=True)
     return path
+
+
+class RecordingJournal:
+    """Сирий PCM (s16le, 16 кГц, моно) дописується на диск щосекунди, поки триває
+    диктування: якщо процес уб'ють/перезапустять посеред запису — надиктоване
+    відновиться при наступному старті."""
+
+    def __init__(self, chunks: list, stamp: str):
+        RECORDINGS_DIR.mkdir(exist_ok=True)
+        # pid в імені — щоб відрізнити журнал живого екземпляра від сироти
+        self.path = RECORDINGS_DIR / f"{stamp}.{os.getpid()}.pcm.part"
+        self._chunks = chunks
+        self._written = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._discarded = False
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        # Спершу пауза, потім скидання — тож тап (коротший за крок скидання)
+        # взагалі не створює файлу
+        while not self._stop.wait(JOURNAL_FLUSH_SEC):
+            try:
+                self.flush_all()
+            except Exception as exc:
+                print(f"⚠️  Помилка аварійного журналу запису: {exc}")
+
+    def flush_all(self) -> None:
+        """Синхронно дописує на диск усе, що вже накопичилось у чанках."""
+        with self._lock:
+            if self._discarded:
+                # Інакше open("ab") воскресив би вже видалений журнал — і
+                # наступний старт відновив би з нього дубль уже збереженого WAV
+                return
+            pending = self._chunks[self._written:]
+            if not pending:
+                return
+            audio = np.concatenate(pending)[:, 0]
+            with self.path.open("ab") as f:
+                f.write((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
+            self._written += len(pending)
+
+    def discard(self) -> None:
+        """Аудіо вже надійно лежить у WAV (або запис не вартий збереження) —
+        зупиняємо потік і прибираємо журнал, щоб його не відновили вдруге."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(2)
+        with self._lock:
+            self._discarded = True
+            self.path.unlink(missing_ok=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Чи живий процес. PermissionError означає, що процес є, просто чужий."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def recover_orphan_journals(config: dict) -> list[Path]:
+    """Перетворює аварійні журнали вбитих екземплярів на звичайні WAV
+    (без обробки — її запускає користувач через «Повторити останній запис»).
+    Журнал живого чужого процесу не чіпаємо: він саме в нього й пише."""
+    recovered: list[Path] = []
+    for part in sorted(RECORDINGS_DIR.glob("*.pcm.part")):
+        try:
+            stamp, pid_text = part.name[: -len(".pcm.part")].rsplit(".", 1)
+            pid = int(pid_text)
+        except ValueError:
+            diag(f"аварійний журнал із незрозумілим ім'ям, пропускаю: {part.name}")
+            continue
+        try:
+            idle_sec = time.time() - part.stat().st_mtime
+        except OSError:
+            continue
+        # Збіг із власним pid можливий після os.execv — такий журнал теж сирота.
+        # Живий екземпляр дописує свій журнал щосекунди, тож давно не чіпаний
+        # файл — сирота, чий pid система просто перевикористала.
+        if pid != os.getpid() and _pid_alive(pid) and idle_sec < JOURNAL_STALE_SEC:
+            continue
+        try:
+            raw = part.read_bytes()
+        except OSError as exc:
+            diag(f"не вдалося прочитати аварійний журнал {part.name}: {exc}")
+            continue
+        # Обірваний на пів семпла хвіст відкидаємо
+        samples = np.frombuffer(raw[: len(raw) - len(raw) % 2], dtype=np.int16)
+        if len(samples) / SAMPLE_RATE < config["min_duration_sec"]:
+            part.unlink(missing_ok=True)
+            continue
+        name = stamp if not (RECORDINGS_DIR / f"{stamp}.wav").exists() else f"{stamp}_r"
+        recovered.append(save_recording(
+            samples.astype(np.float32) / 32768.0,
+            config["keep_recordings"], stamp=name,
+        ))
+        part.unlink(missing_ok=True)
+    return recovered
 
 
 def load_recording(path: Path) -> np.ndarray:
@@ -722,6 +861,99 @@ def play_sound(path: str) -> None:
     )
 
 
+# ── Живучий слухач клавіш ──────────────────────────────────────────────────
+
+# macOS вимикає event-tap, коли callback не встиг відповісти (ByTimeout) або коли
+# користувач втрутився (ByUserInput), і повідомляє про це окремою подією.
+_TAP_DISABLED_EVENTS = {
+    Quartz.kCGEventTapDisabledByTimeout & 0xFFFFFFFF,
+    Quartz.kCGEventTapDisabledByUserInput & 0xFFFFFFFF,
+}
+
+# pynput 1.8 не має де ввімкнути tap назад (він локальна змінна в
+# ListenerMixin._run), а саму подію про вимкнення трактує як звичайну — тобто
+# генерує хибний release. Тому підмінюємо два приватні методи; якщо їх у
+# майбутній версії не стане, працюємо на звичайному слухачі без перевірок tap-а.
+_LISTENER_PATCHABLE = all(
+    hasattr(keyboard.Listener, name) for name in ("_create_event_tap", "_handler")
+)
+
+
+class ResilientListener(keyboard.Listener):
+    """keyboard.Listener, який переживає вимкнення event-tap системою:
+    тримає посилання на tap і вмикає його назад замість того, щоб оглухнути
+    до кінця життя процесу."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tap = None
+
+    def _create_event_tap(self):
+        self._tap = super()._create_event_tap()
+        return self._tap
+
+    def _run(self):
+        try:
+            super()._run()
+        finally:
+            # Слухач завершився (stop із потоку здоров'я, виняток у callback-у) —
+            # tap лишився б у WindowServer живим і без обслуговування, а
+            # ensure_enabled() щопівсекунди «вмикав» би мерця
+            tap, self._tap = self._tap, None
+            if tap is not None:
+                try:
+                    Quartz.CGEventTapEnable(tap, False)
+                    if hasattr(Quartz, "CFMachPortInvalidate"):
+                        Quartz.CFMachPortInvalidate(tap)
+                except Exception as exc:
+                    print(f"⚠️  Помилка закриття event-tap: {exc}")
+
+    def _handler(self, proxy, event_type, event, refcon):
+        if (event_type & 0xFFFFFFFF) in _TAP_DISABLED_EVENTS:
+            # Далі в pynput не передаємо: він видав би з цієї події хибний
+            # on_release і «відпустив» клавішу посеред диктування
+            try:
+                if self._tap is not None:
+                    Quartz.CGEventTapEnable(self._tap, True)
+                diag("macOS вимкнув event-tap — увімкнено назад")
+            except Exception as exc:
+                print(f"⚠️  Не вдалося ввімкнути event-tap назад: {exc}")
+            return event
+        return super()._handler(proxy, event_type, event, refcon)
+
+    def ensure_enabled(self) -> bool:
+        """False — tap був вимкнений (подію про це ми могли й не отримати)
+        і ми щойно ввімкнули його назад. Слухач, що вже не працює, лікує не
+        це, а перестворення в `_start_engine`."""
+        tap = self._tap
+        if tap is None or not self.running or Quartz.CGEventTapIsEnabled(tap):
+            return True
+        Quartz.CGEventTapEnable(tap, True)
+        return False
+
+
+def make_listener(on_press, on_release):
+    if _LISTENER_PATCHABLE:
+        return ResilientListener(on_press=on_press, on_release=on_release)
+    return keyboard.Listener(on_press=on_press, on_release=on_release)
+
+
+class _Recording:
+    """Стан одного диктування. Чанки — власний список цього запису: якщо
+    попередній потік мікрофона не закрився вчасно, його callback дописує туди,
+    а не в наступне диктування."""
+
+    __slots__ = ("gen", "mode", "chunks", "stream", "journal", "confirmed")
+
+    def __init__(self, gen: int, mode: str | None):
+        self.gen = gen
+        self.mode = mode
+        self.chunks: list = []
+        self.stream = None
+        self.journal: "RecordingJournal | None" = None
+        self.confirmed = False
+
+
 class UkrFlow:
     def __init__(self, config: dict):
         self.config = config
@@ -750,8 +982,28 @@ class UkrFlow:
         self._press_time = 0.0
         self._last_tap_release = 0.0
         self._confirm_timer: threading.Timer | None = None
-        self.chunks: list[np.ndarray] = []
-        self.stream: sd.InputStream | None = None
+        # Поточне диктування (аудіо, потік мікрофона, аварійний журнал)
+        self._rec: _Recording | None = None
+        # Час початку попереднього запису — два диктування в ту саму секунду
+        # (подвійний тап) не мають ділити файл аварійного журналу
+        self._last_stamp = ""
+        # Гарячі клавіші, натискання яких дійшло від слухача (press без release).
+        # За цим потік здоров'я відрізняє «клавішу натиснуто, а подій нема»
+        # (глухий tap) від норми.
+        self._hotkey_press: dict = {}
+        # PortAudio не потокобезпечний, а відкриття й закриття потоків тепер
+        # живуть у різних потоках — серіалізуємо їх цим локом
+        self._pa_lock = threading.Lock()
+        # Скільки потоків мікрофона ще не закрилось (закриття могло зависнути)
+        self._pa_unclosed = 0
+        self._pa_count_lock = threading.Lock()
+        # Закривач завис у PortAudio: чекати на _pa_lock більше немає сенсу
+        self._pa_wedged = False
+        self._pa_wedge_notified = False
+        self._pa_skip_lock_logged = False
+        self._listener = None
+        # (команда, час початку) поточної команди воркера — або None
+        self._worker_busy: tuple | None = None
         self.paste_lock = threading.Lock()
 
     # ── Запис ──────────────────────────────────────────────────────────────
@@ -765,30 +1017,40 @@ class UkrFlow:
             return
         # Режим фіксується в момент натискання: клавіша режиму → разовий
         # режим, основна клавіша → поточний «липкий» з конфігу
-        self.active_mode = mode_name or self.config.get("mode")
-        self.chunks = []
+        self._rec_gen += 1
+        rec = _Recording(self._rec_gen, mode_name or self.config.get("mode"))
+        base_stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Номер запису в суфіксі — інакше два диктування в ту саму секунду писали
+        # б у той самий журнал, а discard() першого стер би журнал другого
+        stamp = base_stamp if base_stamp != self._last_stamp else (
+            f"{base_stamp}_{rec.gen}"
+        )
+        self._last_stamp = base_stamp
         # Мікрофон відкриваємо тут — у воркері запису, а НЕ в callback слухача
         # клавіш: відкриття CoreAudio-потоку інколи триває понад секунду, а якщо
         # блокувати ним callback event-tap, macOS вимикає tap за таймаутом — і
         # подія release уже не доходить (pynput її не відновлює), запис «зависає».
         # Виняток теж не пускаємо далі (зайнятий мікрофон тощо).
+        opened_at = time.monotonic()
         try:
-            stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="float32",
-                device=self.config["input_device"],
-                callback=lambda data, *_: self.chunks.append(data.copy()),
-            )
-            stream.start()
+            rec.stream = self._open_stream(rec.chunks)
         except Exception as exc:
-            self.stream = None
             print(f"⚠️  Не вдалося відкрити мікрофон: {exc}")
-            notify(f"Мікрофон недоступний: {exc}")
+            if self._pa_unclosed:
+                # Попередній потік досі не закрився — PortAudio не полікувати
+                # переініціалізацією, лишається перезапуск процесу
+                notify("Мікрофон завис — меню → Перезапустити UkrFlow")
+            else:
+                notify(f"Мікрофон недоступний: {exc}")
             return
-        self.stream = stream
-        self._rec_gen += 1
-        gen = self._rec_gen
+        open_sec = time.monotonic() - opened_at
+        if open_sec > 0.3:
+            diag(f"мікрофон відкривався {open_sec:.1f} с")
+        # Аварійний журнал: поки триває диктування, аудіо живе не лише в RAM
+        rec.journal = RecordingJournal(rec.chunks, stamp)
+        rec.journal.start()
+        self._rec = rec
+        self.active_mode = rec.mode
         self.recording = True
         # Вотчдог: якщо подія release клавіші загубиться (event-tap міг вимкнутись),
         # він за фізичним станом клавіші помітить відпускання й зупинить запис —
@@ -796,107 +1058,248 @@ class UkrFlow:
         vk = _key_vk(key) if key is not None else None
         if vk is not None:
             threading.Thread(
-                target=self._watch_release, args=(vk, gen), daemon=True
+                target=self._watch_release, args=(vk, rec.gen), daemon=True
             ).start()
         # Аудіо пишеться з першої мілісекунди, але фідбек (звук + 🔴)
         # відкладаємо до порогу тапу — щоб подвійний тап перемикання режиму
         # не виглядав і не звучав як запис
         if self.config.get("mode_cycle_double_tap", True):
             self._confirm_timer = threading.Timer(
-                self.config.get("tap_max_sec", 0.35), self._confirm_recording
+                self.config.get("tap_max_sec", 0.35), self._confirm_recording, (rec,)
             )
             self._confirm_timer.daemon = True
             self._confirm_timer.start()
         else:
-            self._confirm_recording()
+            self._confirm_recording(rec)
 
-    def _confirm_recording(self) -> None:
+    def _open_stream(self, chunks: list):
+        """Відкриває мікрофон, дописуючи чанки у список ЦЬОГО диктування. Після
+        збою один раз переініціалізує PortAudio: його список пристроїв застаріває
+        після під'єднання/від'єднання монітора, гарнітури чи iPhone, і відкриття
+        падає, доки процес не перечитає цей список."""
+        def open_once():
+            stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                device=self.config["input_device"],
+                callback=lambda data, *_: chunks.append(data.copy()),
+            )
+            stream.start()
+            with self._pa_count_lock:
+                self._pa_unclosed += 1
+            return stream
+
+        # Закриття попереднього потоку йде своїм потоком — не відкриваємо
+        # мікрофон одночасно з ним. Але якщо закривач уже завис, лок ніхто не
+        # відпустить, а кожна секунда очікування — це втрачений початок фрази.
+        if self._pa_wedged:
+            locked = self._pa_lock.acquire(blocking=False)
+            if not locked and not self._pa_skip_lock_logged:
+                self._pa_skip_lock_logged = True
+                diag("закриття мікрофона зависло — відкриваю без очікування лока")
+        else:
+            locked = self._pa_lock.acquire(timeout=STREAM_CLOSE_TIMEOUT_SEC)
+            if not locked:
+                diag("закриття попереднього мікрофона ще триває — "
+                     "відкриваю без очікування")
+        try:
+            try:
+                return open_once()
+            except Exception as exc:
+                with self._pa_count_lock:
+                    unclosed = self._pa_unclosed
+                if unclosed:
+                    # Pa_Terminate під ногами потоку, що сидить у Pa_StopStream, —
+                    # це негайний segfault. Краще чесний виняток і перезапуск.
+                    diag(f"мікрофон не відкрився ({exc}), але {unclosed} потік(и) "
+                         f"ще не закрито — PortAudio не переініціалізую")
+                    raise
+                diag(f"мікрофон не відкрився ({exc}) — переініціалізую PortAudio")
+                sd._terminate()
+                sd._initialize()
+                return open_once()
+        finally:
+            if locked:
+                self._pa_lock.release()
+
+    def _confirm_recording(self, rec: "_Recording") -> None:
         """Фідбек початку запису — лише коли натискання виявилось утриманням,
         а не тапом."""
-        if not self.recording:
+        if not self.recording or self._rec is not rec:
             return
+        rec.confirmed = True
         self.status.set("🔴" + mode_suffix(self.active_mode))
         if self.config["sounds"]:
             play_sound(SOUND_START)
         print("🎙  Запис… (відпустіть клавішу, щоб завершити)")
 
-    def stop_recording(self) -> None:
+    def stop_recording(self, reason: str = "release") -> None:
+        """Лише перемикання стану — жодних операцій із потоком мікрофона: його
+        закриття вміє зависнути в CoreAudio назавжди, а воркер запису мусить
+        лишатись вільним (інакше 🔴 висить, а чанки не доїжджають на диск)."""
         if not self.recording:
             return
         self.recording = False
         if self._confirm_timer is not None:
             self._confirm_timer.cancel()
             self._confirm_timer = None
-        # Закриваємо мікрофон і забираємо аудіо — швидко. Уся важка робота
-        # (склейка масиву, запис WAV, розпізнавання) — окремим потоком, щоб не
-        # блокувати ні воркер запису, ні (через нього) потік слухача клавіш.
-        stream, self.stream = self.stream, None
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception as exc:
-                print(f"⚠️  Помилка закриття мікрофона: {exc}")
-        chunks, self.chunks = self.chunks, []
+        rec, self._rec = self._rec, None
+        if rec is None:
+            return
+        if rec.confirmed:
+            # Відпускання зараховано — показуємо це одразу, ще до склейки й
+            # збереження. Тапи лишаються тихими: у них confirmed=False.
+            self.status.set("⏳" + mode_suffix(rec.mode))
+        # Тап має бути тихим і в консолі — логуємо лише справжні диктування
+        # та зупинки не з клавіші (меню, вотчдог, сесія)
+        if rec.confirmed or reason != "release":
+            diag(f"зупинка запису: {reason}")
         threading.Thread(
-            target=self._finalize_recording,
-            args=(chunks, self.active_mode),
-            daemon=True,
+            target=self._finalize_recording, args=(rec,), daemon=True
         ).start()
 
-    def _finalize_recording(self, chunks, mode_name) -> None:
-        """Склейка аудіо, збереження на диск і запуск обробки — у власному
-        потоці (важке, тому поза потоком запису й слухача клавіш)."""
-        audio = (
-            np.concatenate(chunks)[:, 0]
-            if chunks
-            else np.zeros(0, dtype=np.float32)
-        )
-        duration = len(audio) / SAMPLE_RATE
-        # Тап (коротший за поріг подвійного тапу) — повністю тихий:
-        # без звуків, без зміни іконки, без повідомлень у консолі
-        was_tap = duration <= self.config.get("tap_max_sec", 0.35)
-        if self.config["sounds"] and not was_tap:
-            play_sound(SOUND_STOP)
-        if duration < self.config["min_duration_sec"]:
-            if not was_tap:
-                print(f"…надто короткий запис ({duration:.1f} с), пропускаю")
-                self.status.set(self.status.idle_title)
-            return
-        rms = float(np.sqrt(np.mean(audio**2)))
-        if rms < self.config["silence_rms_threshold"]:
-            print("…тиша, пропускаю")
-            self.status.set(self.status.idle_title)
+    def _close_stream(self, rec: "_Recording") -> None:
+        """Закриття CoreAudio-потоку вміє не повернутись ніколи — закриваємо в
+        окремому потоці й не чекаємо довше за STREAM_CLOSE_TIMEOUT_SEC, щоб
+        надиктоване в будь-якому разі доїхало на диск."""
+        stream, rec.stream = rec.stream, None
+        if stream is None:
             return
 
-        # Аудіо на диск ще ДО обробки: за будь-якого збою далі голос збережено
-        wav_path = save_recording(audio, self.config["keep_recordings"])
-        self._process_safely(audio, duration, wav_path, mode_name)
+        def close():
+            try:
+                with self._pa_lock:
+                    stream.stop()
+                    stream.close()
+            except Exception as exc:
+                print(f"⚠️  Помилка закриття мікрофона: {exc}")
+            finally:
+                # Небезпечний для PortAudio лише потік, що ЗАВИС усередині нього;
+                # якщо закривач дійшов сюди — він уже не там
+                with self._pa_count_lock:
+                    self._pa_unclosed -= 1
+                    if self._pa_unclosed == 0:
+                        # Завислий закривач таки прокинувся — можна знову чекати
+                        # на лок, як у нормальному режимі
+                        self._pa_wedged = False
+
+        closer = threading.Thread(target=close, daemon=True)
+        closer.start()
+        closer.join(STREAM_CLOSE_TIMEOUT_SEC)
+        if closer.is_alive():
+            self._pa_wedged = True
+            diag(f"мікрофон не закрився за {STREAM_CLOSE_TIMEOUT_SEC:.0f} с — "
+                 "продовжую без очікування")
+            if not self._pa_wedge_notified:
+                self._pa_wedge_notified = True
+                notify("Мікрофон не закрився (збій CoreAudio). Диктування "
+                       "збережено й обробляється; щоб наступні не гальмували — "
+                       "меню → Перезапустити UkrFlow")
+
+    def _finalize_recording(self, rec: "_Recording") -> None:
+        """Склейка аудіо, збереження на диск і запуск обробки — у власному
+        потоці (важке, тому поза потоком запису й слухача клавіш). Увесь у
+        try/except: виняток тут означав би тихо втрачене диктування."""
+        wav_path = None
+        try:
+            self._close_stream(rec)
+            audio = (
+                np.concatenate(rec.chunks)[:, 0]
+                if rec.chunks
+                else np.zeros(0, dtype=np.float32)
+            )
+            duration = len(audio) / SAMPLE_RATE
+            # Тап (коротший за поріг подвійного тапу) — повністю тихий:
+            # без звуків, без зміни іконки, без повідомлень у консолі
+            was_tap = duration <= self.config.get("tap_max_sec", 0.35)
+            if self.config["sounds"] and not was_tap:
+                play_sound(SOUND_STOP)
+            if duration < self.config["min_duration_sec"]:
+                rec.journal.discard()
+                if not was_tap:
+                    print(f"…надто короткий запис ({duration:.1f} с), пропускаю")
+                # На межі порогу тап устигає стати підтвердженим: тоді ⏳ вже
+                # показано і його треба зняти, інакше іконка застрягне
+                if not was_tap or rec.confirmed:
+                    self.status.set(self.status.idle_title)
+                return
+            rms = float(np.sqrt(np.mean(audio**2)))
+            if rms < self.config["silence_rms_threshold"]:
+                rec.journal.discard()
+                print("…тиша, пропускаю")
+                self.status.set(self.status.idle_title)
+                return
+
+            # Аудіо на диск ще ДО обробки: за будь-якого збою далі голос збережено
+            wav_path = save_recording(audio, self.config["keep_recordings"])
+            rec.journal.discard()
+            self._process_safely(audio, duration, wav_path, rec.mode)
+        except Exception as exc:
+            if wav_path is None:
+                # До WAV не дійшло — дописуємо все, що є, в аварійний журнал і
+                # лишаємо його на диску: наступний старт відновить із нього
+                try:
+                    rec.journal.flush_all()
+                except Exception as journal_exc:
+                    print(f"⚠️  Не вдалося дописати аварійний журнал: {journal_exc}")
+                notify(f"Збій збереження запису: {exc}. Аудіо в аварійному журналі "
+                       "— відновиться після перезапуску (меню → Перезапустити "
+                       "UkrFlow).")
+            else:
+                notify(f"Збій після збереження запису: {exc}. Аудіо збережено — "
+                       "меню → Повторити останній запис")
+            self.status.set("⚠️")
+            if self.config["sounds"]:
+                play_sound(SOUND_ERROR)
+            diag(f"збій фіналізації запису: {exc}\n{traceback.format_exc()}")
 
     def _watch_release(self, vk: int, gen: int) -> None:
         """Стежить за фізичним станом гарячої клавіші під час запису. Якщо бачив
         її натиснутою, а потім відпущеною, поки запис ще триває, — подія release
-        загубилась (event-tap міг вимкнутись за таймаутом); зупиняємо запис самі,
-        диктування не гине. Зупиняє ЛИШЕ після того, як реально побачив клавішу
-        натиснутою, — тож якщо опитування стану для цієї клавіші не працює, запис
-        не обрізається (безпечний фолбек на звичайний release)."""
-        seen_down = False
-        state = Quartz.kCGEventSourceStateCombinedSessionState
+        загубилась (event-tap міг вимкнутись за таймаутом) або прийшла як press
+        (pynput розрізняє модифікатори за спільним прапорцем: із затиснутим лівим
+        Cmd відпускання правого виглядає як натискання); зупиняємо запис самі.
+        Опитуємо два джерела стану — HID і сесію — бо жодне не надійне саме по
+        собі, і зупиняємо лише після ДВОХ поспіль «відпущено» від джерела, яке
+        вже бачило клавішу натиснутою: хибний одиничний нуль не обріже диктування,
+        а якщо стан не читається взагалі — лишається звичайний release."""
+        states = (
+            Quartz.kCGEventSourceStateHIDSystemState,
+            Quartz.kCGEventSourceStateCombinedSessionState,
+        )
+        seen_down = dict.fromkeys(states, False)
+        released = dict.fromkeys(states, 0)
+        polls = 0
+        poll_failed = False
         while self.recording and self._rec_gen == gen:
             time.sleep(0.12)
             if not (self.recording and self._rec_gen == gen):
                 return
-            try:
-                down = bool(Quartz.CGEventSourceKeyState(state, vk))
-            except Exception:
-                return
-            if down:
-                seen_down = True
-            elif seen_down:
-                print("⚠️  Клавішу відпущено, але подія release не дійшла — "
-                      "зупиняю запис (вотчдог). Диктування збережено.")
-                self._cmd_queue.put(("stop", None, None))
-                return
+            polls += 1
+            for state in states:
+                try:
+                    down = bool(Quartz.CGEventSourceKeyState(state, vk))
+                except Exception as exc:
+                    if not poll_failed:
+                        poll_failed = True
+                        diag(f"не вдалося прочитати стан клавіші: {exc}")
+                    continue
+                if down:
+                    seen_down[state] = True
+                    released[state] = 0
+                    continue
+                if not seen_down[state]:
+                    continue
+                released[state] += 1
+                if released[state] >= 2:
+                    print("⚠️  Клавішу відпущено, але подія release не дійшла — "
+                          "зупиняю запис (вотчдог). Диктування збережено.")
+                    diag(f"вотчдог: клавіша vk={vk} відпущена, події release немає")
+                    self._cmd_queue.put(("stop", "вотчдог", None))
+                    return
+            if polls == 12 and not any(seen_down.values()):
+                diag("стан клавіші не читається — вотчдог неактивний для цього запису")
 
     # ── Розпізнавання і вставлення ─────────────────────────────────────────
 
@@ -908,11 +1311,13 @@ class UkrFlow:
             self.status.set("⚠️")
             if self.config["sounds"]:
                 play_sound(SOUND_ERROR)
-            notify(f"Збій обробки: {exc}. Аудіо збережено — ./run.sh --retry")
+            notify(f"Збій обробки: {exc}. Аудіо збережено — "
+                   f"меню → Повторити останній запис")
             print(
                 f"❌ Обробка не вдалася: {exc}\n"
                 f"   Аудіо збережено: {wav_path}\n"
-                f"   Повторити без передиктовування: ./run.sh --retry"
+                f"   Повторити без передиктовування: меню → «Повторити останній "
+                f"запис» або ./run.sh --retry"
             )
             log_block(f"❌ ЗБІЙ: {exc} (запис: {wav_path.name})\n")
 
@@ -961,6 +1366,10 @@ class UkrFlow:
         after_dict = apply_dictionary(raw, self.dictionary)
         if after_dict != raw:
             log_block("── Після словника ──", after_dict)
+
+        # Проміжний запис у last.md: якщо процес уб'ють під час шліфування
+        # (воно триває секунди), надиктоване вже доступне в «Останній результат»
+        save_last_result(after_dict, mode_name, note="нешліфований — шліфування триває")
 
         self.status.set("✨" + suffix)
         polished, polish_sec = polish_text(after_dict, cfg)
@@ -1037,8 +1446,10 @@ class UkrFlow:
         try:
             if key == self.hotkey:
                 self._press_time = time.time()
+                self._hotkey_press[key] = time.monotonic()
                 self._cmd_queue.put(("start", None, key))
             elif key in self.mode_hotkeys:
+                self._hotkey_press[key] = time.monotonic()
                 self._cmd_queue.put(("start", self.mode_hotkeys[key], key))
         except Exception as exc:
             print(f"⚠️  Помилка обробки натискання клавіші: {exc}")
@@ -1046,10 +1457,12 @@ class UkrFlow:
     def on_release(self, key) -> None:
         try:
             if key == self.hotkey:
-                self._cmd_queue.put(("stop", None, None))
+                self._hotkey_press.pop(key, None)
+                self._cmd_queue.put(("stop", "release", None))
                 self._handle_tap()
             elif key in self.mode_hotkeys:
-                self._cmd_queue.put(("stop", None, None))
+                self._hotkey_press.pop(key, None)
+                self._cmd_queue.put(("stop", "release", None))
         except Exception as exc:
             print(f"⚠️  Помилка обробки відпускання клавіші: {exc}")
 
@@ -1058,14 +1471,85 @@ class UkrFlow:
         виконуються по черзі, тож старт завжди передує відповідному стопу
         (без гонок «стоп раніше за старт»)."""
         while True:
-            cmd, mode_name, key = self._cmd_queue.get()
+            cmd, arg, key = self._cmd_queue.get()
+            self._worker_busy = (cmd, time.monotonic())
             try:
                 if cmd == "start":
-                    self.start_recording(mode_name, key)
+                    self.start_recording(arg, key)
                 elif cmd == "stop":
-                    self.stop_recording()
+                    self.stop_recording(arg or "release")
+                elif cmd == "cycle":
+                    self.cycle_mode()
             except Exception as exc:
                 print(f"⚠️  Помилка воркера запису: {exc}")
+            finally:
+                self._worker_busy = None
+
+    def _watch_health(self) -> None:
+        """Стежить, що слухач клавіш живий і чує: вмикає назад вимкнений системою
+        event-tap, помічає «глухий» tap (клавіша фізично натиснута, а подій від
+        слухача немає) і заклинений воркер запису. Без цього потоку єдиним
+        лікуванням лишається перезапуск процесу вручну."""
+        hotkeys = [self.hotkey, *self.mode_hotkeys]
+        down_since: dict = {}
+        up_polls: dict = {}
+        last_restart = 0.0
+        stuck_reported = None
+        while True:
+            time.sleep(HEALTH_POLL_SEC)
+            try:
+                listener = self._listener
+                if listener is not None and hasattr(listener, "ensure_enabled"):
+                    if not listener.ensure_enabled():
+                        diag("event-tap був вимкнений macOS — увімкнено назад")
+                now = time.monotonic()
+                busy = self._worker_busy
+                if busy is not None and now - busy[1] > WORKER_STUCK_SEC:
+                    if stuck_reported is not busy:
+                        stuck_reported = busy
+                        diag(f"воркер запису заклинило на команді «{busy[0]}» "
+                             f"({now - busy[1]:.0f} с)")
+                        self.status.set("⚠️")
+                        notify("UkrFlow завис (мікрофон?) — меню → Перезапустити "
+                               "UkrFlow. Надиктоване збережено.")
+                # Глухий tap шукаємо лише в спокої: під час запису й поки воркер
+                # зайнятий, натиснута клавіша — це норма
+                idle = self._session_active and not self.recording and busy is None
+                for key in hotkeys:
+                    vk = _key_vk(key)
+                    if vk is None:
+                        continue
+                    if not Quartz.CGEventSourceKeyState(
+                        Quartz.kCGEventSourceStateHIDSystemState, vk
+                    ):
+                        down_since.pop(key, None)
+                        up_polls[key] = up_polls.get(key, 0) + 1
+                        # Загублений release інакше лишив би клавішу «натиснутою»
+                        # назавжди й вимкнув детектор глухого tap-а
+                        if up_polls[key] >= 2 and not self.recording:
+                            self._hotkey_press.pop(key, None)
+                        continue
+                    up_polls[key] = 0
+                    # Клавіша натиснута. Якщо її press дійшов від слухача —
+                    # tap чує, і неважливо, чому запис уже не триває (меню,
+                    # вотчдог, збій мікрофона)
+                    if not idle or key in self._hotkey_press:
+                        down_since.pop(key, None)
+                        continue
+                    since = down_since.setdefault(key, now)
+                    if now - since < DEAF_TAP_HOLD_SEC:
+                        continue
+                    if listener is None or now - last_restart < 30:
+                        continue
+                    last_restart = now
+                    down_since.pop(key, None)
+                    diag("клавіша натиснута, а подій від слухача немає — "
+                         "перезапускаю слухач клавіш")
+                    notify("Слухач клавіш перезапущено — натисніть клавішу ще раз")
+                    # Запис не стартуємо самі: користувач натисне клавішу знову
+                    listener.stop()
+            except Exception as exc:
+                print(f"⚠️  Помилка потоку здоров'я: {exc}")
 
     def _watch_session(self) -> None:
         """Стежить, чи активна (на екрані) наша сесія. Коли профіль перемикають
@@ -1083,7 +1567,7 @@ class UkrFlow:
                 print("⏸  Профіль неактивний — звільняю мікрофон, чекаю.")
                 if self.recording:
                     # Зберегти й обробити те, що вже наговорено, і віддати мікрофон
-                    self._cmd_queue.put(("stop", None, None))
+                    self._cmd_queue.put(("stop", "сесія", None))
             else:
                 print("▶️  Профіль знову активний — UkrFlow готовий до диктування.")
 
@@ -1104,7 +1588,10 @@ class UkrFlow:
         )
         if gap_ok:
             self._last_tap_release = 0.0
-            self.cycle_mode()
+            # Не перемикаємо режим прямо тут: save_config пише на диск, а notify
+            # форкає великий процес — повільний callback macOS карає вимкненням
+            # event-tap. Віддаємо воркеру.
+            self._cmd_queue.put(("cycle", None, None))
         else:
             self._last_tap_release = now
 
@@ -1192,11 +1679,83 @@ class UkrFlow:
         # Слідкування за активністю сесії (Fast User Switching)
         self._session_active = _session_on_console()
         threading.Thread(target=self._watch_session, daemon=True).start()
-        listener = keyboard.Listener(
-            on_press=self.on_press, on_release=self.on_release
-        )
-        listener.start()
-        listener.join()
+        threading.Thread(target=self._watch_health, daemon=True).start()
+        if not _LISTENER_PATCHABLE:
+            diag("приватний API pynput змінився — живучий слухач недоступний, "
+                 "перевірки здоров'я event-tap вимкнено")
+        # Слухач у циклі: він завершується сам (виняток у callback-і, stop із
+        # потоку здоров'я), а без нового екземпляра програма лишилась би глухою
+        # до клавіш до кінця життя процесу.
+        backoff = 1.0
+        while True:
+            started = time.monotonic()
+            try:
+                self._listener = make_listener(self.on_press, self.on_release)
+                self._listener.start()
+                self._listener.join()
+            except Exception as exc:
+                print(f"⚠️  Слухач клавіш завершився з помилкою: {exc}")
+            lived = time.monotonic() - started
+            if lived < 5:
+                # Без дозволу Input Monitoring tap не створюється і _run
+                # повертається одразу — не спамимо лог перезапусками
+                if backoff == 1.0:
+                    diag("слухач клавіш не тримається (немає дозволу Input "
+                         "Monitoring?) — повторюю рідше, до 30 с")
+                backoff = min(backoff * 2, 30.0)
+            else:
+                backoff = 1.0
+                diag(f"слухач клавіш завершився ({lived:.0f} с) — перезапускаю")
+            time.sleep(backoff)
+
+    def retry_last_recording(self) -> None:
+        """Переобробка найновішого запису з recordings/ у поточному липкому
+        режимі — те саме, що `./run.sh --retry`, але модель уже прогріта."""
+        recordings = sorted(RECORDINGS_DIR.glob("*.wav"))
+        if not recordings:
+            notify("Немає збережених записів у recordings/")
+            return
+        path = recordings[-1]
+        audio = load_recording(path)
+        duration = len(audio) / SAMPLE_RATE
+        print(f"🔁 Повторна обробка {path.name} ({duration:.1f} с аудіо).")
+        threading.Thread(
+            target=self._process_safely,
+            args=(audio, duration, path, self.config.get("mode")),
+            daemon=True,
+        ).start()
+
+    def restart(self) -> None:
+        """Перезапуск процесу з меню — лікування зависань, які вже сталися.
+        Незавершений запис тут не обробляємо: скидаємо аварійний журнал на диск
+        і лишаємо його, а після старту `recover_orphan_journals` підбере його
+        тим самим шляхом, що й після аварійного вбивства процесу."""
+        diag("перезапуск на вимогу користувача")
+        rec = self._rec
+        if rec is not None and rec.journal is not None:
+            try:
+                rec.journal.flush_all()
+            except Exception as exc:
+                print(f"⚠️  Не вдалося дописати аварійний журнал: {exc}")
+        sys.stdout.flush()
+        if os.environ.get("XPC_SERVICE_NAME") == LAUNCHD_LABEL:
+            # Під launchd перезапускає сам launchd; якщо він чомусь нас не вб'є —
+            # виходимо з ненульовим кодом, і KeepAlive (SuccessfulExit=false)
+            # підніме процес знову
+            subprocess.Popen(
+                ["launchctl", "kickstart", "-k",
+                 f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            fallback = threading.Timer(5.0, lambda: os._exit(1))
+            fallback.daemon = True
+            fallback.start()
+            return
+        try:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+        except OSError as exc:
+            diag(f"перезапуск не вдався: {exc}")
+            notify(f"Перезапуск не вдався: {exc}")
 
     def run(self) -> None:
         if not accessibility_trusted(prompt=True):
@@ -1215,6 +1774,20 @@ class UkrFlow:
         LOG_PATH.touch(exist_ok=True)
         LAST_PATH.touch(exist_ok=True)
         RECORDINGS_DIR.mkdir(exist_ok=True)
+        # Аудіо з диктування, обірваного вбивством процесу, — у звичайні WAV.
+        # Що б тут не сталося, старт застосунку це валити не має.
+        try:
+            for path in recover_orphan_journals(self.config):
+                try:
+                    seconds = int(path.stat().st_size / 2 / SAMPLE_RATE)
+                except OSError:
+                    seconds = 0
+                length = f"{seconds // 60}:{seconds % 60:02d}"
+                diag(f"відновлено незавершений запис: {path.name} ({length})")
+                notify(f"Відновлено незавершений запис ({length}) — "
+                       "меню → Повторити останній запис")
+        except Exception as exc:
+            diag(f"збій відновлення аварійних журналів: {exc}")
         try:
             import rumps
         except ImportError:
@@ -1247,6 +1820,16 @@ class UkrFlow:
         app.menu = [
             mode_menu,
             backend_menu,
+            None,
+            rumps.MenuItem(
+                "Зупинити запис",
+                callback=lambda _: self._cmd_queue.put(("stop", "меню", None)),
+            ),
+            rumps.MenuItem(
+                "Повторити останній запис",
+                callback=lambda _: self.retry_last_recording(),
+            ),
+            None,
             rumps.MenuItem(
                 "Останній результат",
                 callback=lambda _: subprocess.Popen(["open", str(LAST_PATH)]),
@@ -1258,6 +1841,11 @@ class UkrFlow:
             rumps.MenuItem(
                 "Папка записів",
                 callback=lambda _: subprocess.Popen(["open", str(RECORDINGS_DIR)]),
+            ),
+            None,
+            rumps.MenuItem(
+                "Перезапустити UkrFlow",
+                callback=lambda _: self.restart(),
             ),
         ]
         self.status.attach(app)
@@ -1274,6 +1862,11 @@ def retry_last(mode_name: str | None = None) -> None:
             f"Невідомий режим: {mode_name!r}. "
             f"Доступні: {', '.join(config.get('modes', {}))}"
         )
+    try:
+        for recovered in recover_orphan_journals(config):
+            diag(f"відновлено незавершений запис: {recovered.name}")
+    except Exception as exc:
+        diag(f"збій відновлення аварійних журналів: {exc}")
     recordings = sorted(RECORDINGS_DIR.glob("*.wav"))
     if not recordings:
         raise SystemExit("Немає збережених записів у recordings/.")
@@ -1297,6 +1890,16 @@ def _arg_after(args: list, flag: str) -> str | None:
 
 
 def main() -> None:
+    # Під launchd stdout — файл, а отже буферизується блоками: при вбивстві
+    # процесу хвіст лога губиться і від інциденту не лишається слідів
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+    under_launchd = os.environ.get("XPC_SERVICE_NAME") == LAUNCHD_LABEL
+    diag(f"старт UkrFlow (pid {os.getpid()}, "
+         f"{'під launchd' if under_launchd else 'з термінала'})")
     args = sys.argv[1:]
     if "--set-hotkey" in args:
         set_hotkey_interactive(_arg_after(args, "--set-hotkey"))

@@ -11,7 +11,7 @@
   "polish_local_model": "mlx-community/Qwen3-8B-4bit",
   "polish_api_model": "claude-opus-4-8",
   "polish_min_chars": 25,
-  "mode": "clean",
+  "mode": "raw",
   "mode_cycle_double_tap": true,
   "tap_max_sec": 0.35,
   "double_tap_gap_sec": 0.5,
