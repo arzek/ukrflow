@@ -3,15 +3,15 @@
   "model": "mlx-community/whisper-large-v3-turbo",
   "language": "uk",
   "initial_prompt": "Диктування українською мовою, з розділовими знаками.",
-  "polish": "codex",
-  "polish_codex_model": "gpt-5.6-terra",
+  "polish": "claude-code",
+  "polish_codex_model": "gpt-6-luna",
   "polish_codex_effort": "low",
-  "polish_claude_code_model": "opus",
+  "polish_claude_code_model": "haiku",
   "polish_claude_code_effort": "low",
   "polish_local_model": "mlx-community/Qwen3-8B-4bit",
   "polish_api_model": "claude-opus-4-8",
   "polish_min_chars": 25,
-  "mode": "raw",
+  "mode": "clean",
   "mode_cycle_double_tap": true,
   "tap_max_sec": 0.35,
   "double_tap_gap_sec": 0.5,
@@ -23,14 +23,14 @@
     "clean": {
       "label": "Clean — шліфування без переробки",
       "prompt_file": "prompts/clean.md",
-      "polish_codex_model": "gpt-5.6-terra",
+      "polish_codex_model": "gpt-6-luna",
       "polish_codex_effort": "low"
     },
     "prompt": {
       "label": "Prompt — шліфування + prompt engineering",
       "prompt_file": "prompts/prompt.md",
-      "polish_codex_model": "gpt-5.6-sol",
-      "polish_codex_effort": "high"
+      "polish_codex_model": "gpt-6-luna",
+      "polish_codex_effort": "low"
     }
   },
   "retries": 2,

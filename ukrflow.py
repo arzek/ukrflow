@@ -63,10 +63,10 @@ DEFAULT_CONFIG = {
     #   "off"         — без шліфування
     "polish": "codex",
     # Модель та глибина мислення для Codex (доступність залежить від акаунта)
-    "polish_codex_model": "gpt-5.6-terra",
+    "polish_codex_model": "gpt-6-luna",
     "polish_codex_effort": "low",
     # Модель та глибина мислення для claude-code (opus + low ≈ 5–10 с)
-    "polish_claude_code_model": "opus",
+    "polish_claude_code_model": "haiku",
     "polish_claude_code_effort": "low",
     # Локальна модель для шліфування (MLX)
     "polish_local_model": "mlx-community/Qwen3-8B-4bit",
@@ -94,14 +94,14 @@ DEFAULT_CONFIG = {
         "clean": {
             "label": "Clean — шліфування без переробки",
             "prompt_file": "prompts/clean.md",
-            "polish_codex_model": "gpt-5.6-terra",
+            "polish_codex_model": "gpt-6-luna",
             "polish_codex_effort": "low",
         },
         "prompt": {
             "label": "Prompt — шліфування + prompt engineering",
             "prompt_file": "prompts/prompt.md",
-            "polish_codex_model": "gpt-5.6-sol",
-            "polish_codex_effort": "high",
+            "polish_codex_model": "gpt-6-luna",
+            "polish_codex_effort": "low",
         },
     },
     # Додаткові спроби при збоях розпізнавання/шліфування
