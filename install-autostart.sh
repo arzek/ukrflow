@@ -24,9 +24,9 @@ CLAUDE_BIN_DIR=""
 command -v claude >/dev/null && CLAUDE_BIN_DIR="$(dirname "$(command -v claude)"):"
 
 # Два екземпляри б'ються за гарячі клавіші й мікрофон — ручний зупиняємо.
-if pgrep -f "[Pp]ython.* ukrflow\.py" >/dev/null; then
+if pgrep -U "$(id -u)" -f "[Pp]ython.* ukrflow\.py" >/dev/null; then
     echo "⏹  Зупиняю екземпляр, запущений вручну…"
-    pkill -f "[Pp]ython.* ukrflow\.py" || true
+    pkill -U "$(id -u)" -f "[Pp]ython.* ukrflow\.py" || true
     sleep 1
 fi
 

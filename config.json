@@ -3,7 +3,7 @@
   "model": "mlx-community/whisper-large-v3-turbo",
   "language": "uk",
   "initial_prompt": "Диктування українською мовою, з розділовими знаками.",
-  "polish": "claude-code",
+  "polish": "codex",
   "polish_codex_model": "gpt-6-luna",
   "polish_codex_effort": "low",
   "polish_claude_code_model": "haiku",

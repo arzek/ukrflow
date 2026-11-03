@@ -4,3 +4,5 @@ recordings/
 ukrflow.log
 launchd.log
 last.md
+server.log
+runs/
